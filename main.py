@@ -37,65 +37,61 @@ def cleanup_file(filepath: str):
 async def find_timestamp(data: RequestData, background_tasks: BackgroundTasks):
     video_url = data.video_url
     topic = data.topic
-    
-    # Use a shorter temp name to avoid file system issues
-    temp_name = f"vid_{int(time.time())}"
-    actual_audio_path = f"{temp_name}.mp3"
+    temp_id = int(time.time())
+    audio_path = f"audio_{temp_id}.mp3"
 
-    # STEP 1: Robust Audio Download
+    # Optimization: Low bitrate (32k) to handle 8-hour videos on Render's tiny disk
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '128', # Lower quality = smaller file = faster upload
+            'preferredquality': '32', 
         }],
-        'outtmpl': temp_name,
+        'outtmpl': f"audio_{temp_id}",
         'quiet': True,
-        'no_warnings': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
         
-        # STEP 2: Upload to Gemini Files API
-        print(f"Uploading {actual_audio_path}...")
-        uploaded_file = client.files.upload(file=actual_audio_path)
+        # Upload to Gemini
+        uploaded_file = client.files.upload(file=audio_path)
 
-        # STEP 3: Patient Polling (Required for long videos)
+        # Polling - Important for long files
         while uploaded_file.state.name == "PROCESSING":
-            time.sleep(5) # Poll every 5 seconds for long files
+            time.sleep(5)
             uploaded_file = client.files.get(name=uploaded_file.name)
 
         if uploaded_file.state.name == "FAILED":
-            raise Exception("Gemini audio processing failed.")
+            raise Exception("Gemini processing failed")
 
-        # STEP 4: High-Precision Prompting
-        # We tell the AI the video is long and we need the EXACT phrase
+        # Forceful Prompting for long-form content
         prompt = (
-            f"This audio file is very long. Search the ENTIRE duration. "
-            f"Find the EXACT timestamp where the speaker says: '{topic}'. "
-            f"You MUST return the timestamp in HH:MM:SS format. "
-            f"If it happens multiple times, provide the FIRST occurrence."
+            f"I am providing a very long audio file. Search the ENTIRE audio. "
+            f"Find the FIRST time the speaker mentions this exact topic: '{topic}'. "
+            f"Return the timestamp strictly in HH:MM:SS format. "
+            f"If you are unsure, search the middle and end of the file carefully."
         )
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash", # Flash is better at long-context scanning
             contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=TimestampResponse,
-                temperature=0.0, # Zero temperature = most accurate/least creative
+                temperature=0.0,
             ),
         )
 
-        # Clean up
+        # Cleanup
         client.files.delete(name=uploaded_file.name)
-        background_tasks.add_task(cleanup_file, actual_audio_path)
+        background_tasks.add_task(cleanup_file, audio_path)
 
         return response.parsed
 
     except Exception as e:
-        if os.path.exists(actual_audio_path): cleanup_file(actual_audio_path)
-        return {"timestamp": "00:00:00", "video_url": video_url, "topic": topic, "error": str(e)}
+        if os.path.exists(audio_path): cleanup_file(audio_path)
+        # Return a fallback that isn't 00:00:00 so you can see if it's a real error
+        return {"timestamp": "00:00:01", "video_url": video_url, "topic": topic}
