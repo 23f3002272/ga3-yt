@@ -7,90 +7,77 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
-# 1. Initialize FastAPI
 app = FastAPI()
 
-# 2. FIX: ADD CORS MIDDLEWARE
-# This allows the validator or any website to call your API without being blocked.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 3. Initialize Gemini Client (New google-genai library)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 4. Define Data Models (Schemas)
 class RequestData(BaseModel):
     video_url: str
     topic: str
 
 class TimestampResponse(BaseModel):
-    timestamp: str  # Must be HH:MM:SS
+    timestamp: str
     video_url: str
     topic: str
 
-# 5. Helper Function for Cleanup
 def cleanup_file(filepath: str):
     if os.path.exists(filepath):
-        try:
-            os.remove(filepath)
-            print(f"Successfully deleted {filepath}")
-        except Exception as e:
-            print(f"Error deleting file: {e}")
+        os.remove(filepath)
 
-# 6. The API Endpoint
 @app.post("/ask", response_model=TimestampResponse)
 async def find_timestamp(data: RequestData, background_tasks: BackgroundTasks):
     video_url = data.video_url
     topic = data.topic
     
-    # Unique filename to avoid collisions
-    temp_id = int(time.time())
-    audio_filename = f"audio_{temp_id}.mp3"
+    # Use a shorter temp name to avoid file system issues
+    temp_name = f"vid_{int(time.time())}"
+    actual_audio_path = f"{temp_name}.mp3"
 
-    # STEP 1: Download Audio Only using yt-dlp
+    # STEP 1: Robust Audio Download
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '192',
+            'preferredquality': '128', # Lower quality = smaller file = faster upload
         }],
-        'outtmpl': f"audio_{temp_id}", # yt-dlp adds the .mp3 automatically
+        'outtmpl': temp_name,
         'quiet': True,
-        'no_warnings': True
+        'no_warnings': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
         
-        actual_path = f"audio_{temp_id}.mp3"
-
         # STEP 2: Upload to Gemini Files API
-        print(f"Uploading {actual_path} to Gemini...")
-        uploaded_file = client.files.upload(file=actual_path)
+        print(f"Uploading {actual_audio_path}...")
+        uploaded_file = client.files.upload(file=actual_audio_path)
 
-        # STEP 3: Wait for Gemini to process (Polling)
+        # STEP 3: Patient Polling (Required for long videos)
         while uploaded_file.state.name == "PROCESSING":
-            print("Gemini is processing the audio...")
-            time.sleep(3)
+            time.sleep(5) # Poll every 5 seconds for long files
             uploaded_file = client.files.get(name=uploaded_file.name)
 
         if uploaded_file.state.name == "FAILED":
             raise Exception("Gemini audio processing failed.")
 
-        # STEP 4: Ask Gemini to locate the topic
-        # Note: Using the HH:MM:SS requirement in the prompt
+        # STEP 4: High-Precision Prompting
+        # We tell the AI the video is long and we need the EXACT phrase
         prompt = (
-            f"You are a video search assistant. Listen to this audio and find the EXACT "
-            f"time when the speaker mentions '{topic}'. "
-            f"You MUST return the response in HH:MM:SS format (e.g., 00:04:12)."
+            f"This audio file is very long. Search the ENTIRE duration. "
+            f"Find the EXACT timestamp where the speaker says: '{topic}'. "
+            f"You MUST return the timestamp in HH:MM:SS format. "
+            f"If it happens multiple times, provide the FIRST occurrence."
         )
 
         response = client.models.generate_content(
@@ -99,26 +86,16 @@ async def find_timestamp(data: RequestData, background_tasks: BackgroundTasks):
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=TimestampResponse,
+                temperature=0.0, # Zero temperature = most accurate/least creative
             ),
         )
 
-        # Clean up the file from Gemini's server (best practice)
+        # Clean up
         client.files.delete(name=uploaded_file.name)
+        background_tasks.add_task(cleanup_file, actual_audio_path)
 
-        # Schedule local file cleanup for later
-        background_tasks.add_task(cleanup_file, actual_path)
-
-        # Return the parsed JSON object directly
         return response.parsed
 
     except Exception as e:
-        # In case of error, still try to clean up
-        if 'actual_path' in locals():
-            background_tasks.add_task(cleanup_file, actual_path)
-        return {"error": str(e), "timestamp": "00:00:00", "video_url": video_url, "topic": topic}
-
-if __name__ == "__main__":
-    import uvicorn
-    # Use port 8000 for local testing or Render's dynamic port
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        if os.path.exists(actual_audio_path): cleanup_file(actual_audio_path)
+        return {"timestamp": "00:00:00", "video_url": video_url, "topic": topic, "error": str(e)}
